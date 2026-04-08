@@ -58,6 +58,9 @@ class GRPOConfig(_BaseConfig):
         num_generations_eval (`int` or `None`, *optional*):
             Number of generations to sample during evaluation. This allows using fewer generations during evaluation to
             save computation. If `None`, uses the value of `num_generations`.
+        max_prompt_length (`int` or `None`, *optional*):
+            Maximum length of the tokenized prompt. Longer prompts are truncated from the right. If `None`, no
+            truncation is applied.
         max_completion_length (`int` or `None`, *optional*, defaults to `256`):
             Maximum length of the generated completion.
         ds3_gather_for_generation (`bool`, *optional*, defaults to `True`):
@@ -393,6 +396,13 @@ class GRPOConfig(_BaseConfig):
         metadata={
             "help": "Number of generations to sample during evaluation. This allows using fewer generations during "
             "evaluation to save computation. If `None`, uses the value of `num_generations`."
+        },
+    )
+    max_prompt_length: int | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum length of the tokenized prompt. Longer prompts are truncated from the right. "
+            "If None, no truncation is applied."
         },
     )
     max_completion_length: int | None = field(

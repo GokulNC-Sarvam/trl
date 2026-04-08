@@ -521,6 +521,7 @@ class GRPOTrainer(_BaseTrainer):
             self.chat_template = None
 
         # Training arguments
+        self.max_prompt_length = args.max_prompt_length
         self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
         self.num_generations = args.num_generations  # = G in the GRPO paper
         self.max_tool_calling_iterations = args.max_tool_calling_iterations or sys.maxsize
@@ -533,6 +534,9 @@ class GRPOTrainer(_BaseTrainer):
         self.repetition_penalty = args.repetition_penalty
         self.use_transformers_paged = args.use_transformers_paged
         self.pad_to_multiple_of = args.pad_to_multiple_of
+        self.is_encoder_decoder = getattr(model.config, "is_encoder_decoder", False)
+        if self.is_encoder_decoder:
+            self.decoder_start_token_id = model.config.decoder_start_token_id
         self.use_vllm = args.use_vllm
         self.vllm_mode = args.vllm_mode
         self.vllm_gpu_memory_utilization = args.vllm_gpu_memory_utilization  # only applies to colocation mode
@@ -1025,8 +1029,18 @@ class GRPOTrainer(_BaseTrainer):
         token_type_ids=None,
         mm_token_type_ids=None,
         image_position_ids=None,
+        encoder_input_ids=None,
+        encoder_attention_mask=None,
+        completion_ids=None,
+        completion_mask=None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Compute log-probs and (optionally) entropies for each token."""
+        if self.is_encoder_decoder:
+            return self._get_per_token_logps_and_entropies_encoder_decoder(
+                model, encoder_input_ids, encoder_attention_mask, completion_ids, completion_mask,
+                batch_size=batch_size, compute_entropy=compute_entropy,
+            )
+
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
         all_entropies = []
@@ -1079,6 +1093,53 @@ class GRPOTrainer(_BaseTrainer):
             logits.div_(self.temperature)
             completion_ids = input_ids_batch[:, -logits_to_keep:]
             logps = selective_log_softmax(logits, completion_ids)  # compute logprobs
+            all_logps.append(logps)
+
+            if compute_entropy:
+                with torch.no_grad():
+                    entropies = entropy_from_logits(logits)
+                all_entropies.append(entropies)
+
+        logps = torch.cat(all_logps, dim=0)
+        entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
+        return logps, entropies
+
+    def _get_per_token_logps_and_entropies_encoder_decoder(
+        self, model, encoder_input_ids, encoder_attention_mask, completion_ids, completion_mask,
+        batch_size=None, compute_entropy=False,
+    ):
+        """Encoder-decoder variant: pass encoder and decoder inputs separately."""
+        batch_size = batch_size or encoder_input_ids.size(0)
+        device = encoder_input_ids.device
+        all_logps = []
+        all_entropies = []
+
+        for start in range(0, encoder_input_ids.size(0), batch_size):
+            enc_ids_batch = encoder_input_ids[start : start + batch_size]
+            enc_mask_batch = encoder_attention_mask[start : start + batch_size]
+            comp_ids_batch = completion_ids[start : start + batch_size]
+            comp_mask_batch = completion_mask[start : start + batch_size]
+
+            # Build decoder_input_ids: [decoder_start_token, completion[:-1]] (teacher forcing)
+            bos = torch.full(
+                (comp_ids_batch.size(0), 1), self.decoder_start_token_id,
+                dtype=comp_ids_batch.dtype, device=device,
+            )
+            decoder_input_ids = torch.cat([bos, comp_ids_batch[:, :-1]], dim=1)
+            decoder_attention_mask = torch.cat(
+                [torch.ones_like(bos), comp_mask_batch[:, :-1]], dim=1,
+            )
+
+            logits = model(
+                input_ids=enc_ids_batch,
+                attention_mask=enc_mask_batch,
+                decoder_input_ids=decoder_input_ids,
+                decoder_attention_mask=decoder_attention_mask,
+                use_cache=False,
+            ).logits  # (B, T, V) where T = len(completion_ids)
+
+            logits.div_(self.temperature)
+            logps = selective_log_softmax(logits, comp_ids_batch)
             all_logps.append(logps)
 
             if compute_entropy:
@@ -1301,7 +1362,10 @@ class GRPOTrainer(_BaseTrainer):
             # For VLMs, the processor returns extra multimodal fields (pixel_values, image_grid_thw, etc.)
             multimodal_fields = {k: v for k, v in tokenized.items() if k not in ("input_ids", "attention_mask")}
         else:
-            prompt_ids = self.processing_class(text=prompts)["input_ids"]
+            tokenizer_kwargs = {}
+            if self.max_prompt_length is not None:
+                tokenizer_kwargs.update(truncation=True, max_length=self.max_prompt_length)
+            prompt_ids = self.processing_class(text=prompts, **tokenizer_kwargs)["input_ids"]
             images = None
             multimodal_fields = {}
         return prompt_ids, images, multimodal_fields
@@ -1382,12 +1446,17 @@ class GRPOTrainer(_BaseTrainer):
                 torch.no_grad(),
                 FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
             ):
-                prompt_completion_ids = unwrapped_model.generate(
+                generated_ids = unwrapped_model.generate(
                     **generate_inputs, generation_config=self.generation_config
                 )
-            # Compute prompt length and extract completion ids
-            prompt_length = generate_inputs["input_ids"].size(1)
-            completion_ids = prompt_completion_ids[:, prompt_length:]
+
+            if self.is_encoder_decoder:
+                # Encoder-decoder generate() returns decoder-only tokens: [BOS, t1, ..., EOS].
+                # Strip the leading decoder_start_token_id to get the actual completion.
+                completion_ids = generated_ids[:, 1:]
+            else:
+                prompt_length = generate_inputs["input_ids"].size(1)
+                completion_ids = generated_ids[:, prompt_length:]
 
             # Mask everything after the first EOS token
             is_eos = completion_ids == self.eos_token_id
@@ -2000,11 +2069,15 @@ class GRPOTrainer(_BaseTrainer):
             if tool_mask is not None:
                 tool_mask = tool_mask * (~is_truncated).unsqueeze(1).int()
 
-        # Concatenate prompt_mask with completion_mask for logit computation
-        prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (B, P+C)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
+        if self.is_encoder_decoder:
+            # For encoder-decoder, keep encoder and decoder inputs separate
+            logits_to_keep = completion_ids.size(1)
+        else:
+            # Concatenate prompt_mask with completion_mask for logit computation
+            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (B, P+C)
+            attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
+            logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
         num_images = [len(img_list) if img_list else 0 for img_list in images] if images is not None else None
@@ -2122,14 +2195,21 @@ class GRPOTrainer(_BaseTrainer):
             if self.args.gradient_accumulation_steps % generate_every != 0 or (
                 self.use_vllm and self.vllm_importance_sampling_correction
             ):
+                if self.is_encoder_decoder:
+                    _logps_kwargs = dict(
+                        encoder_input_ids=prompt_ids, encoder_attention_mask=prompt_mask,
+                        completion_ids=completion_ids, completion_mask=completion_mask,
+                    )
+                else:
+                    _logps_kwargs = dict(num_images=num_images, **forward_kwargs)
+
                 old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                     self.model,
-                    prompt_completion_ids,
-                    attention_mask,
+                    prompt_completion_ids if not self.is_encoder_decoder else prompt_ids,
+                    attention_mask if not self.is_encoder_decoder else prompt_mask,
                     logits_to_keep,
                     batch_size,
-                    num_images=num_images,
-                    **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, image_sizes, image_position_ids
+                    **_logps_kwargs,
                 )
             else:
                 old_per_token_logps = None
@@ -2167,15 +2247,22 @@ class GRPOTrainer(_BaseTrainer):
 
             # Compute the per-token log probabilities for the reference model
             if self.beta != 0.0:
+                if self.is_encoder_decoder:
+                    _ref_logps_kwargs = dict(
+                        encoder_input_ids=prompt_ids, encoder_attention_mask=prompt_mask,
+                        completion_ids=completion_ids, completion_mask=completion_mask,
+                    )
+                else:
+                    _ref_logps_kwargs = dict(num_images=num_images, **forward_kwargs)
+
                 if self.ref_model is not None:
                     ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                         self.ref_model,
-                        prompt_completion_ids,
-                        attention_mask,
+                        prompt_completion_ids if not self.is_encoder_decoder else prompt_ids,
+                        attention_mask if not self.is_encoder_decoder else prompt_mask,
                         logits_to_keep,
                         batch_size=batch_size,
-                        num_images=num_images,
-                        **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, image_sizes, image_position_ids
+                        **_ref_logps_kwargs,
                     )
                 else:
                     # When training a PEFT adapter, how we obtain the reference depends on the setup:
@@ -2185,12 +2272,11 @@ class GRPOTrainer(_BaseTrainer):
                     with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
                         ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                             self.model,
-                            prompt_completion_ids,
-                            attention_mask,
+                            prompt_completion_ids if not self.is_encoder_decoder else prompt_ids,
+                            attention_mask if not self.is_encoder_decoder else prompt_mask,
                             logits_to_keep,
                             batch_size=batch_size,
-                            num_images=num_images,
-                            **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, image_sizes, image_position_ids
+                            **_ref_logps_kwargs,
                         )
             else:
                 ref_per_token_logps = None
@@ -2378,6 +2464,8 @@ class GRPOTrainer(_BaseTrainer):
         return output
 
     def compute_liger_loss(self, unwrapped_model, inputs):
+        if self.is_encoder_decoder:
+            raise NotImplementedError("Liger kernel is not supported for encoder-decoder models.")
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
@@ -2512,27 +2600,33 @@ class GRPOTrainer(_BaseTrainer):
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         mask = completion_mask if "tool_mask" not in inputs else completion_mask * inputs["tool_mask"]
 
-        # Compute the per_token_logps and the entropy at each position in the completion
-        per_token_logps, entropies = self._get_per_token_logps_and_entropies(
-            model,
-            input_ids,
-            attention_mask,
-            logits_to_keep,
-            compute_entropy=True,
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
-            num_images=inputs.get("num_images"),
-            pixel_attention_mask=inputs.get("pixel_attention_mask"),
-            image_sizes=inputs.get("image_sizes"),
-            token_type_ids=inputs.get("token_type_ids"),
-            mm_token_type_ids=inputs.get("mm_token_type_ids"),
-            image_position_ids=inputs.get("image_position_ids"),
-        )
+        if self.is_encoder_decoder:
+            per_token_logps, entropies = self._get_per_token_logps_and_entropies(
+                model, prompt_ids, prompt_mask, logits_to_keep, compute_entropy=True,
+                encoder_input_ids=prompt_ids, encoder_attention_mask=prompt_mask,
+                completion_ids=completion_ids, completion_mask=completion_mask,
+            )
+        else:
+            input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+            per_token_logps, entropies = self._get_per_token_logps_and_entropies(
+                model,
+                input_ids,
+                attention_mask,
+                logits_to_keep,
+                compute_entropy=True,
+                pixel_values=inputs.get("pixel_values"),
+                image_grid_thw=inputs.get("image_grid_thw"),
+                num_images=inputs.get("num_images"),
+                pixel_attention_mask=inputs.get("pixel_attention_mask"),
+                image_sizes=inputs.get("image_sizes"),
+                token_type_ids=inputs.get("token_type_ids"),
+                mm_token_type_ids=inputs.get("mm_token_type_ids"),
+                image_position_ids=inputs.get("image_position_ids"),
+            )
 
         if self.top_entropy_quantile < 1.0:
             entropy_mask = self.get_high_entropy_mask(entropies, mask, 1 - self.top_entropy_quantile)
