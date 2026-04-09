@@ -548,6 +548,7 @@ class GRPOTrainer(_BaseTrainer):
         self.loss_type = args.loss_type
         self.multi_objective_aggregation = args.multi_objective_aggregation
         self.scale_rewards = args.scale_rewards
+        self.max_advantage_value = getattr(args, "max_advantage_value", None)
         self.importance_sampling_level = args.importance_sampling_level
         self.off_policy_mask_threshold = args.off_policy_mask_threshold
         if self.use_liger_kernel and self.off_policy_mask_threshold is not None:
@@ -2326,6 +2327,8 @@ class GRPOTrainer(_BaseTrainer):
             advantages = rewards - mean_grouped_rewards
             if self.scale_rewards != "none":
                 advantages = advantages / (std_rewards + 1e-4)
+            if self.max_advantage_value is not None:
+                advantages = advantages.clamp(-self.max_advantage_value, self.max_advantage_value)
             is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))  # for logging
 
         elif self.multi_objective_aggregation == "normalize_then_sum":

@@ -716,6 +716,14 @@ class GRPOConfig(_BaseConfig):
             "scaling by the standard deviation introduces a question-level difficulty bias."
         },
     )
+    max_advantage_value: float | None = field(
+        default=None,
+        metadata={
+            "help": "If set, clamp advantages to [-max_advantage_value, max_advantage_value] after normalization. "
+            "Useful with scale_rewards='group' to prevent exploding advantages when the within-group reward "
+            "standard deviation is very small."
+        },
+    )
     loss_type: str = field(
         default="dapo",
         metadata={
