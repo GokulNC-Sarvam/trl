@@ -181,6 +181,12 @@ def disable_dropout_in_model(model: torch.nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, torch.nn.Dropout):
             module.p = 0
+        # Some models (e.g. MBart) use F.dropout(x, p=self.dropout, training=self.training)
+        # instead of nn.Dropout modules. Zero out config-level dropout attributes so that
+        # functional dropout calls also become no-ops.
+        for attr in ("dropout", "attention_dropout", "activation_dropout", "classifier_dropout"):
+            if hasattr(module, attr) and isinstance(getattr(module, attr), float) and getattr(module, attr) > 0:
+                setattr(module, attr, 0.0)
 
 
 def get_quantization_config(model_args: ModelConfig) -> BitsAndBytesConfig | None:
